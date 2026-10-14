@@ -1,148 +1,337 @@
 
+/*
+ * Three-Wavelength FDM Oximeter
+ * Particle Argon + Teleplot
+ *
+ * LEDs:
+ * 660 nm -> D8 -> 7 Hz
+ * 805 nm -> A4 -> 11 Hz
+ * 940 nm -> A0 -> 17 Hz
+ *
+ * OPT101P photodetector -> A1
+ *
+ * ADC sampling: 500 Hz
+ * Raw Teleplot updates: 100 Hz
+ * Demodulated updates: 1 Hz
+ */
+
 #include "Particle.h"
+#include <math.h>
+#include <stdio.h>
 
 SYSTEM_MODE(MANUAL);
+SYSTEM_THREAD(ENABLED);
 
-// Particle Argon I2C LCD backpack test
-// Supports common PCF8574 backpacks
-// Default display: 16 columns x 2 rows
+// ----------------------------
+// Hardware configuration
+// ----------------------------
 
-const uint8_t LCD_RS = 0x01;
-const uint8_t LCD_EN = 0x04;
-const uint8_t LCD_BL = 0x08;
+const int LED_PINS[3] = {D8, A4, A0};
+const uint32_t LED_FREQS[3] = {7, 11, 17};
+const uint8_t DUTY_CYCLE = 128;
 
-uint8_t lcdAddress = 0;
-bool lcdReady = false;
+const int SENSOR_PIN = A1;
 
-// Find a PCF8574 or PCF8574A backpack
-uint8_t findLCD() {
-    for (uint8_t addr = 0x20; addr <= 0x3F; addr++) {
+// ----------------------------
+// Sampling configuration
+// ----------------------------
 
-        // Valid address ranges
-        if (addr > 0x27 && addr < 0x38)
-            continue;
+const uint32_t SAMPLE_RATE = 500;
+const uint32_t SAMPLE_PERIOD_US =
+    1000000UL / SAMPLE_RATE;
 
-        Wire.beginTransmission(addr);
+const uint16_t WINDOW_SIZE = SAMPLE_RATE;
 
-        if (Wire.endTransmission() == 0) {
-            return addr;
+// Send every 5th sample (100 Hz)
+// Change to 10 for 50 Hz plotting
+const uint8_t PLOT_EVERY_N_SAMPLES = 5;
+
+const float ADC_SCALE = 3.3f / 4095.0f;
+const float TWO_PI = 6.28318530718f;
+
+// ----------------------------
+// Demodulation state
+// ----------------------------
+
+struct Channel {
+    float cosStep;
+    float sinStep;
+    float cosPhase;
+    float sinPhase;
+    float sumI;
+    float sumQ;
+};
+
+Channel channels[3];
+
+uint32_t nextSampleTime;
+uint32_t droppedWindows = 0;
+
+uint16_t sampleCount = 0;
+float dcSum = 0;
+
+// ----------------------------
+// Teleplot state
+// ----------------------------
+
+// Latest raw sample for plotting
+float plotVoltage = 0;
+bool plotPending = false;
+uint8_t plotDivider = 0;
+
+// Most recent demodulation results
+float lastDC = 0;
+float lastAmplitude[3] = {0, 0, 0};
+uint32_t lastDropped = 0;
+
+// 0-4: summary channels waiting to send
+// 5: no summary pending
+uint8_t summaryIndex = 5;
+
+// ----------------------------
+// Reset measurement window
+// ----------------------------
+
+void resetWindow() {
+    sampleCount = 0;
+    dcSum = 0;
+
+    for (int i = 0; i < 3; i++) {
+        channels[i].cosPhase = 1.0f;
+        channels[i].sinPhase = 0.0f;
+        channels[i].sumI = 0.0f;
+        channels[i].sumQ = 0.0f;
+    }
+}
+
+// ----------------------------
+// Process ADC sample
+// ----------------------------
+
+void processSample(float voltage) {
+    dcSum += voltage;
+
+    for (int i = 0; i < 3; i++) {
+        Channel &ch = channels[i];
+
+        ch.sumI += voltage * ch.cosPhase;
+        ch.sumQ += voltage * ch.sinPhase;
+
+        float nextCos =
+            ch.cosPhase * ch.cosStep -
+            ch.sinPhase * ch.sinStep;
+
+        float nextSin =
+            ch.sinPhase * ch.cosStep +
+            ch.cosPhase * ch.sinStep;
+
+        ch.cosPhase = nextCos;
+        ch.sinPhase = nextSin;
+    }
+
+    sampleCount++;
+
+    // Capture raw sensor data for Teleplot
+    if (++plotDivider >= PLOT_EVERY_N_SAMPLES) {
+        plotDivider = 0;
+        plotVoltage = voltage;
+        plotPending = true;
+    }
+}
+
+// ----------------------------
+// Calculate completed window
+// ----------------------------
+
+void reportWindow() {
+    lastDC = dcSum / WINDOW_SIZE;
+
+    for (int i = 0; i < 3; i++) {
+        float I = channels[i].sumI;
+        float Q = channels[i].sumQ;
+
+        lastAmplitude[i] =
+            (2.0f / WINDOW_SIZE) *
+            sqrtf(I * I + Q * Q);
+    }
+
+    lastDropped = droppedWindows;
+
+    // Queue results for Teleplot
+    summaryIndex = 0;
+}
+
+// ----------------------------
+// Nonblocking Teleplot output
+// ----------------------------
+
+void sendTeleplot() {
+    if (!Serial.isConnected()) {
+        plotPending = false;
+        summaryIndex = 5;
+        return;
+    }
+
+    // Avoid filling the USB serial buffer
+    if (Serial.availableForWrite() < 48) {
+        return;
+    }
+
+    char line[64];
+    int length = 0;
+    bool sendingRaw = false;
+
+    if (plotPending) {
+        // Raw photodetector voltage
+        length = snprintf(
+            line, sizeof(line),
+            ">photo_v:%.4f\n",
+            plotVoltage
+        );
+
+        sendingRaw = true;
+    }
+    else if (summaryIndex < 5) {
+        switch (summaryIndex) {
+            case 0:
+                length = snprintf(
+                    line, sizeof(line),
+                    ">dc_v:%.6f\n", lastDC);
+                break;
+
+            case 1:
+                length = snprintf(
+                    line, sizeof(line),
+                    ">red_v:%.6f\n",
+                    lastAmplitude[0]);
+                break;
+
+            case 2:
+                length = snprintf(
+                    line, sizeof(line),
+                    ">ir805_v:%.6f\n",
+                    lastAmplitude[1]);
+                break;
+
+            case 3:
+                length = snprintf(
+                    line, sizeof(line),
+                    ">ir940_v:%.6f\n",
+                    lastAmplitude[2]);
+                break;
+
+            case 4:
+                length = snprintf(
+                    line, sizeof(line),
+                    ">dropped_windows:%lu\n",
+                    (unsigned long)lastDropped);
+                break;
         }
     }
-    return 0;
-}
+    else {
+        return;
+    }
 
-// Send byte to the I2C backpack
-void lcdExpanderWrite(uint8_t data) {
-    Wire.beginTransmission(lcdAddress);
-    Wire.write(data | LCD_BL);
-    Wire.endTransmission();
-}
+    if (length <= 0 ||
+        length >= (int)sizeof(line)) {
+        return;
+    }
 
-// Pulse LCD enable
-void lcdPulse(uint8_t data) {
-    lcdExpanderWrite(data | LCD_EN);
-    delayMicroseconds(1);
-    lcdExpanderWrite(data & ~LCD_EN);
-    delayMicroseconds(50);
-}
+    // Only transmit if the complete line fits
+    if (Serial.availableForWrite() >= length) {
+        Serial.write(
+            (const uint8_t*)line,
+            (size_t)length
+        );
 
-// Send 4 bits
-void lcdNibble(uint8_t nibble, uint8_t mode) {
-    lcdPulse((nibble << 4) | mode);
-}
-
-// Send command or character
-void lcdSend(uint8_t value, uint8_t mode) {
-    lcdNibble(value >> 4, mode);
-    lcdNibble(value & 0x0F, mode);
-}
-
-void lcdCommand(uint8_t command) {
-    lcdSend(command, 0);
-
-    if (command == 0x01 || command == 0x02) {
-        delay(2);
+        if (sendingRaw) {
+            plotPending = false;
+        } else {
+            summaryIndex++;
+        }
     }
 }
 
-// Display text
-void lcdPrint(const char* text) {
-    while (*text) {
-        lcdSend((uint8_t)*text++, LCD_RS);
-    }
-}
-
-// Set cursor position
-void lcdCursor(uint8_t col, uint8_t row) {
-    const uint8_t offsets[] = {
-        0x00, 0x40, 0x14, 0x54
-    };
-
-    if (row > 3) return;
-
-    lcdCommand(0x80 | (offsets[row] + col));
-}
-
-// Initialize LCD in 4-bit mode
-void lcdBegin() {
-    delay(50);
-
-    lcdNibble(0x03, 0);
-    delay(5);
-
-    lcdNibble(0x03, 0);
-    delay(5);
-
-    lcdNibble(0x03, 0);
-    delayMicroseconds(200);
-
-    lcdNibble(0x02, 0);
-
-    lcdCommand(0x28);  // 4-bit, 2-line
-    lcdCommand(0x0C);  // Display ON
-    lcdCommand(0x06);  // Entry mode
-    lcdCommand(0x01);  // Clear screen
-}
+// ----------------------------
+// Setup
+// ----------------------------
 
 void setup() {
     Serial.begin(115200);
-    Wire.begin();
 
-    delay(100);
+    pinMode(SENSOR_PIN, INPUT);
 
-    lcdAddress = findLCD();
+    // Configure LED modulation
+    for (int i = 0; i < 3; i++) {
+        pinMode(LED_PINS[i], OUTPUT);
 
-    if (lcdAddress == 0) {
-        Serial.println("LCD NOT FOUND");
-        return;
+        analogWrite(
+            LED_PINS[i],
+            DUTY_CYCLE,
+            LED_FREQS[i]
+        );
+
+        float angle =
+            TWO_PI * LED_FREQS[i] /
+            SAMPLE_RATE;
+
+        channels[i].cosStep = cosf(angle);
+        channels[i].sinStep = sinf(angle);
     }
 
-    Serial.printf("LCD found at 0x%02X\n", lcdAddress);
+    resetWindow();
 
-    lcdBegin();
-    lcdReady = true;
-
-    lcdCursor(0, 0);
-    lcdPrint("PARTICLE ARGON");
-
-    lcdCursor(0, 1);
-    lcdPrint("LCD TEST OK");
+    nextSampleTime =
+        micros() + SAMPLE_PERIOD_US;
 }
 
+// ----------------------------
+// Main loop
+// ----------------------------
+
 void loop() {
-    if (!lcdReady) {
-        delay(1000);
+    uint32_t now = micros();
+
+    int32_t lateness =
+        (int32_t)(now - nextSampleTime);
+
+    // Between ADC samples, send plot data
+    if (lateness < 0) {
+        // Allow at least 1.2 ms before
+        // the next scheduled ADC sample
+        if (-lateness > 1200) {
+            sendTeleplot();
+        }
         return;
     }
 
-    static unsigned long count = 0;
-    char line[17];
+    // Detect missed sampling deadlines
+    if (lateness >=
+        (int32_t)SAMPLE_PERIOD_US) {
 
-    snprintf(line, sizeof(line),
-             "Count: %-9lu", count++);
+        droppedWindows++;
+        resetWindow();
 
-    lcdCursor(0, 1);
-    lcdPrint(line);
+        nextSampleTime =
+            now + SAMPLE_PERIOD_US;
 
-    delay(1000);
+        return;
+    }
+
+    nextSampleTime += SAMPLE_PERIOD_US;
+
+    // Read photodetector
+    int raw = analogRead(SENSOR_PIN);
+    float voltage = raw * ADC_SCALE;
+
+    processSample(voltage);
+
+    // Completed 1-second window
+    if (sampleCount >= WINDOW_SIZE) {
+        reportWindow();
+        resetWindow();
+
+        nextSampleTime =
+            micros() + SAMPLE_PERIOD_US;
+    }
 }
